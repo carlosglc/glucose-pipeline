@@ -1,0 +1,14 @@
+logindata.json
+data-*.json
+*.db
+*.sqlite
+*.sqlite3
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+geckodriver.log
+.DS_Store
+.idea/
+.vscode/
