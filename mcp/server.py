@@ -36,6 +36,25 @@ _CACHE_TTL_SECONDS = 120
 _cache: dict = {"data": None, "at": 0.0}
 
 
+def _normalize(data: dict) -> dict:
+    """Repair known upstream data quirks at the ingestion boundary.
+
+    CareLink emits sg=0 for a reading that does not exist yet: a pending
+    entry stamped with server time, sitting off the five-minute grid.
+    Zero is not a glucose value — it is not a value at all — so it is
+    normalized to None here, once, rather than leaving every downstream
+    consumer to rediscover the quirk.
+    """
+    for s in data.get("sgs", []):
+        if not s.get("sg"):
+            s["sg"] = None
+
+    if "lastSG" in data and not data["lastSG"].get("sg"):
+        data["lastSG"]["sg"] = None
+
+    return data
+
+
 def _fetch() -> dict:
     """Return patientData, using a short-lived cache."""
     now = time.time()
@@ -53,19 +72,9 @@ def _fetch() -> dict:
     if not recent or "patientData" not in recent:
         raise RuntimeError("CareLink returned no patient data.")
 
-    data = recent["patientData"]
-
-    # CareLink emits sg=0 for readings that don't exist yet — a pending
-    # entry stamped with server time, off the 5-minute grid. Zero is not
-    # a glucose value; normalize it to None at the boundary so no
-    # downstream consumer has to know this.
-    for s in data.get("sgs", []):
-        if not s.get("sg"):
-            s["sg"] = None
-    if not data.get("lastSG", {}).get("sg"):
-        data.setdefault("lastSG", {})["sg"] = None
-
+    data = _normalize(recent["patientData"])
     _cache.update(data=data, at=now)
+    return data
 
 
 def _parse(ts: str) -> datetime:
@@ -84,6 +93,11 @@ def _within(items: list, hours: float) -> list:
     return [i for i in items if _parse(i["timestamp"]).timestamp() >= cutoff]
 
 
+def _valid_readings(data: dict) -> list:
+    """Sensor readings that actually carry a value."""
+    return [s for s in data.get("sgs", []) if s.get("sg") is not None]
+
+
 @mcp.tool()
 def get_current_glucose() -> dict:
     """Current glucose reading with trend direction, plus live device state.
@@ -92,10 +106,9 @@ def get_current_glucose() -> dict:
     "am I dropping?", "how much insulin is active?"
     """
     d = _fetch()
-    return {
-        "glucose_mgdl": d.get("lastSG", {}).get("sg"),
+
+    state = {
         "trend": d.get("lastSGTrend"),
-        "reading_time": d.get("lastSG", {}).get("timestamp"),
         "timezone": d.get("clientTimeZoneName"),
         "active_insulin_units": d.get("activeInsulin", {}).get("amount"),
         "smartguard": d.get("therapyAlgorithmState", {}).get("autoModeShieldState"),
@@ -103,6 +116,32 @@ def get_current_glucose() -> dict:
         "sensor_ok": d.get("gstCommunicationState"),
         "sensor_age_hours": d.get("sensorDurationHours"),
         "reservoir_units": d.get("reservoirRemainingUnits"),
+    }
+
+    current = d.get("lastSG", {}).get("sg")
+    if current is not None:
+        return {
+            "glucose_mgdl": current,
+            "reading_time": d.get("lastSG", {}).get("timestamp"),
+            **state,
+        }
+
+    # The newest entry is a pending placeholder. Fall back to the most
+    # recent real reading rather than reporting a value that isn't one.
+    valid = _valid_readings(d)
+    if not valid:
+        return {
+            "glucose_mgdl": None,
+            "error": "No sensor reading available.",
+            **state,
+        }
+
+    last = valid[-1]
+    return {
+        "glucose_mgdl": last["sg"],
+        "reading_time": last["timestamp"],
+        "note": "Latest reading still pending; showing the previous one.",
+        **state,
     }
 
 
@@ -115,7 +154,7 @@ def get_glucose_summary(hours: float = 24) -> dict:
     """
     d = _fetch()
     window = _within(d.get("sgs", []), hours)
-    values = [s["sg"] for s in window if s.get("sg")]
+    values = [s["sg"] for s in window if s.get("sg") is not None]
 
     if not values:
         return {"error": "No sensor readings in that window."}
@@ -147,12 +186,15 @@ def get_glucose_readings(hours: float = 6) -> dict:
 
     Use when the shape of the curve matters — spikes, rate of change,
     what happened around a specific time. Keep the window small.
+
+    A reading with mgdl=null is a genuine gap, not a zero.
     """
     d = _fetch()
     window = _within(d.get("sgs", []), hours)
     return {
         "timezone": d.get("clientTimeZoneName"),
         "count": len(window),
+        "gaps": len([s for s in window if s.get("sg") is None]),
         "readings": [
             {"time": s["timestamp"], "mgdl": s.get("sg")} for s in window
         ],
